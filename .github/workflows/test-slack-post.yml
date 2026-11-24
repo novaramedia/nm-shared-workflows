@@ -1,0 +1,58 @@
+name: Test slack-post
+
+# Manual self-test: posts one sample message per run so changes to
+# slack-post.yml can be checked in Slack before a release is tagged.
+# Needs a SLACK_BOT_TOKEN secret on this repo; the bot must be in the channel.
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Channel to post the test to'
+        required: true
+        type: string
+      status:
+        description: 'Status to test'
+        required: true
+        type: choice
+        default: success
+        options: [success, ok, approved, received, info, warning, failure]
+      mention_on_failure:
+        description: 'Slack user/group ID to ping (failure only)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  post:
+    uses: ./.github/workflows/slack-post.yml
+    with:
+      channel: ${{ inputs.channel }}
+      status: ${{ inputs.status }}
+      title: slack-post test (${{ inputs.status }})
+      changelog_version: '1.0.0'
+      body: |
+        Test post from **nm-shared-workflows**. The release notes below are pulled from this repo's CHANGELOG.
+      buttons: |
+        Repo | ${{ github.server_url }}/${{ github.repository }}
+        Run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      mention_on_failure: ${{ inputs.mention_on_failure }}
+    secrets:
+      slack_bot_token: ${{ secrets.SLACK_BOT_TOKEN }}
+
+  reply:
+    # Checks threading: replies under the first post via its `ts` output.
+    needs: post
+    if: ${{ needs.post.outputs.ts != '' }}
+    uses: ./.github/workflows/slack-post.yml
+    with:
+      channel: ${{ inputs.channel }}
+      status: received
+      title: Threaded reply test
+      show_footer: false
+      thread_ts: ${{ needs.post.outputs.ts }}
+    secrets:
+      slack_bot_token: ${{ secrets.SLACK_BOT_TOKEN }}

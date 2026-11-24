@@ -1,0 +1,280 @@
+name: Slack post
+
+# Reusable workflow: post a Block Kit message to Slack via a bot token.
+# Follows the Slack Messages rules in nm-agents-shared/conventions.md
+# (https://github.com/novaramedia/nm-agents-shared/blob/main/conventions.md#slack-messages).
+#
+# Message layout:
+#   header   — status emoji + title (team emoji: see `status` below)
+#   markdown — body, standard markdown (### headings, **bold**, [links](url)),
+#              plus the CHANGELOG section for `changelog_version` if given
+#   section  — mention, on failure only
+#   actions  — link buttons
+#   context  — footer (repo · workflow · run link · actor), unless show_footer: false
+#
+# Caller example (release deploy):
+#
+#   jobs:
+#     notify:
+#       needs: deploy
+#       if: ${{ !cancelled() }}
+#       uses: novaramedia/nm-shared-workflows/.github/workflows/slack-post.yml@v1
+#       with:
+#         channel: '#team-digital-public'
+#         status: ${{ needs.deploy.result == 'success' && 'success' || 'failure' }}
+#         title: novaramedia.com ${{ github.ref_name }} deployed
+#         changelog_version: ${{ github.ref_name }}
+#         buttons: |
+#           View site | https://novaramedia.com/
+#           Release notes | ${{ github.event.release.html_url }}
+#         mention_on_failure: U0123456789
+#       secrets:
+#         slack_bot_token: ${{ secrets.SLACK_BOT_TOKEN }}
+#
+# The token is a secret of the calling repo: a reusable workflow runs in the
+# caller's context and only sees the secrets the caller passes in.
+# The bot must be a member of the channel.
+#
+# A failed post logs a warning and does not fail the run: the thing being
+# reported on (a deploy, a release) matters more than the notification.
+
+on:
+  workflow_call:
+    inputs:
+      channel:
+        description: 'Channel name (#team-digital-public) or ID'
+        required: true
+        type: string
+      title:
+        description: 'One-line headline. Truncated to fit Slack''s 150-char header limit.'
+        required: true
+        type: string
+      status:
+        description: >-
+          Sets the header emoji and whether `mention_on_failure` fires.
+          success :feelsgood: (went well) · ok :coffee: (fine, routine; a wry yes) ·
+          approved :white_check_mark: · received :inbox_tray: (noted, nothing to do) ·
+          info :information_source: · warning :large_orange_circle: · failure :rotating_light:
+        required: false
+        type: string
+        default: info
+      icon:
+        description: 'Override the status emoji, e.g. :this-is-fine-fire:. Workspace custom emoji work.'
+        required: false
+        type: string
+        default: ''
+      body:
+        description: 'Message body, standard markdown. Optional.'
+        required: false
+        type: string
+        default: ''
+      changelog_version:
+        description: 'If set, the `## [x.y.z]` section of the caller''s CHANGELOG is appended to the body. A leading "v" is ignored.'
+        required: false
+        type: string
+        default: ''
+      changelog_path:
+        description: 'CHANGELOG location in the caller repo'
+        required: false
+        type: string
+        default: CHANGELOG.md
+      buttons:
+        description: 'Link buttons, one per line as "Label | https://url". Up to 5; the first is styled primary.'
+        required: false
+        type: string
+        default: ''
+      mention_on_failure:
+        description: 'Slack user ID (U…) or user-group ID (S…) to ping when status is failure. A plain @name does not ping.'
+        required: false
+        type: string
+        default: ''
+      show_footer:
+        description: 'Show the footer line. Set false for a cleaner message.'
+        required: false
+        type: boolean
+        default: true
+      footer:
+        description: 'Custom footer line (Slack mrkdwn). Empty = repo · workflow · run link · actor.'
+        required: false
+        type: string
+        default: ''
+      thread_ts:
+        description: 'Post as a reply in this thread (the `ts` output of an earlier call).'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      slack_bot_token:
+        description: 'Slack bot token (xoxb-…) with chat:write'
+        required: true
+    outputs:
+      ts:
+        description: 'Timestamp of the posted message, for threading replies. Empty if the post failed.'
+        value: ${{ jobs.post.outputs.ts }}
+
+permissions:
+  contents: read
+
+jobs:
+  post:
+    name: Post to Slack
+    runs-on: ubuntu-latest
+    outputs:
+      ts: ${{ steps.send.outputs.ts }}
+    steps:
+      # Checks out the *caller's* repo (github.repository is the caller in a
+      # reusable workflow), changelog file only.
+      - name: Check out changelog
+        if: ${{ inputs.changelog_version != '' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          sparse-checkout: ${{ inputs.changelog_path }}
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Build payload
+        env:
+          # Every input goes through env + jq --arg: release notes and titles
+          # are untrusted, and must not be templated into the script or able
+          # to break the JSON payload.
+          CHANNEL: ${{ inputs.channel }}
+          TITLE: ${{ inputs.title }}
+          STATUS: ${{ inputs.status }}
+          ICON: ${{ inputs.icon }}
+          SHOW_FOOTER: ${{ inputs.show_footer }}
+          BODY: ${{ inputs.body }}
+          CHANGELOG_VERSION: ${{ inputs.changelog_version }}
+          CHANGELOG_PATH: ${{ inputs.changelog_path }}
+          BUTTONS: ${{ inputs.buttons }}
+          MENTION: ${{ inputs.mention_on_failure }}
+          FOOTER: ${{ inputs.footer }}
+          THREAD_TS: ${{ inputs.thread_ts }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPO: ${{ github.repository }}
+          WORKFLOW: ${{ github.workflow }}
+          RUN_NUMBER: ${{ github.run_number }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+
+          # Team emoji rather than stock ones. :feelsgood: is a workspace
+          # custom emoji; the rest are standard.
+          case "$STATUS" in
+            success)  icon=':feelsgood:' ;;
+            ok)       icon=':coffee:' ;;
+            approved) icon=':white_check_mark:' ;;
+            received) icon=':inbox_tray:' ;;
+            info)     icon=':information_source:' ;;
+            warning)  icon=':large_orange_circle:' ;;
+            failure)  icon=':rotating_light:' ;;
+            *) echo "::warning::Unknown status '$STATUS', using info"; icon=':information_source:'; STATUS=info ;;
+          esac
+          if [ -n "$ICON" ]; then icon="$ICON"; fi
+
+          header="$icon $TITLE"
+          if [ "${#header}" -gt 150 ]; then header="${header:0:149}…"; fi
+
+          # --- Body: caller's markdown + optional CHANGELOG section ---
+          body="$BODY"
+          if [ -n "$CHANGELOG_VERSION" ]; then
+            version="${CHANGELOG_VERSION#v}"
+            if [ -f "$CHANGELOG_PATH" ]; then
+              # Lines after "## [version]" up to the next "## " heading.
+              # index() rather than a regex so dots in the version match literally.
+              notes=$(awk -v hdr="## [$version]" '
+                index($0, hdr) == 1 { found = 1; next }
+                found && /^## / { exit }
+                found { print }
+              ' "$CHANGELOG_PATH" | sed -e '/./,$!d')  # drop leading blank lines
+              if [ -n "$notes" ]; then
+                body="${body:+$body$'\n\n'}$notes"
+              else
+                echo "::warning::No '## [$version]' section found in $CHANGELOG_PATH"
+              fi
+            else
+              echo "::warning::$CHANGELOG_PATH not found in caller repo"
+            fi
+          fi
+          # Slack's markdown block limit is 12,000 chars per message.
+          if [ "${#body}" -gt 12000 ]; then
+            echo "::warning::Body is ${#body} chars; truncating to Slack's 12,000 limit"
+            body="${body:0:11950}"$'\n\n_…truncated, full notes in the repo CHANGELOG_'
+          fi
+
+          # --- Mention (failure only); IDs only, since @name pings nobody ---
+          mention=''
+          if [ "$STATUS" = failure ] && [ -n "$MENTION" ]; then
+            if [[ "$MENTION" =~ ^S[A-Z0-9]+$ ]]; then mention="<!subteam^$MENTION>"
+            elif [[ "$MENTION" =~ ^[UW][A-Z0-9]+$ ]]; then mention="<@$MENTION>"
+            else echo "::warning::mention_on_failure '$MENTION' is not a Slack user (U…) or group (S…) ID; skipped"
+            fi
+          fi
+
+          # --- Buttons: "Label | URL" per line ---
+          buttons='[]'
+          n=0
+          while IFS= read -r line; do
+            [ -z "${line//[[:space:]]/}" ] && continue
+            label=$(printf '%s' "${line%%|*}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            url=$(printf '%s' "${line#*|}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            if [ "$line" = "${line#*|}" ] || [[ ! "$url" =~ ^https?:// ]] || [ -z "$label" ]; then
+              echo "::warning::Skipping button line (want 'Label | https://url'): $line"
+              continue
+            fi
+            if [ "$n" -ge 5 ]; then echo "::warning::More than 5 buttons; extra ones dropped"; break; fi
+            buttons=$(jq -c --arg label "${label:0:75}" --arg url "$url" --argjson first "$([ "$n" -eq 0 ] && echo true || echo false)" \
+              '. + [{type: "button", text: {type: "plain_text", text: $label, emoji: true}, url: $url}
+                    + (if $first then {style: "primary"} else {} end)]' <<<"$buttons")
+            n=$((n + 1))
+          done <<<"$BUTTONS"
+
+          # --- Footer ---
+          if [ "$SHOW_FOOTER" != true ]; then
+            footer=''
+          elif [ -n "$FOOTER" ]; then
+            footer="$FOOTER"
+          else
+            footer="<$RUN_URL|$REPO · $WORKFLOW · run #$RUN_NUMBER> · by $ACTOR"
+          fi
+
+          jq -n \
+            --arg channel "$CHANNEL" \
+            --arg header "$header" \
+            --arg body "$body" \
+            --arg mention "$mention" \
+            --argjson buttons "$buttons" \
+            --arg footer "$footer" \
+            --arg thread_ts "$THREAD_TS" \
+            '{
+              channel: $channel,
+              text: $header,
+              blocks: (
+                [{type: "header", text: {type: "plain_text", text: $header, emoji: true}}]
+                + (if $body != "" then [{type: "markdown", text: $body}] else [] end)
+                + (if $mention != "" then [{type: "section", text: {type: "mrkdwn", text: $mention}}] else [] end)
+                + (if ($buttons | length) > 0 then [{type: "actions", elements: $buttons}] else [] end)
+                + (if $footer != "" then [{type: "context", elements: [{type: "mrkdwn", text: $footer}]}] else [] end)
+              ),
+              unfurl_links: false,
+              unfurl_media: false
+            }
+            + (if $thread_ts != "" then {thread_ts: $thread_ts} else {} end)' > slack_message.json
+
+          jq . slack_message.json
+
+      - name: Send
+        id: send
+        # errors: false (the default) means a Slack error doesn't fail the step;
+        # the next step surfaces it as a warning instead.
+        uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a # v2.1.1
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.slack_bot_token }}
+          payload-file-path: slack_message.json
+
+      - name: Report Slack errors
+        if: ${{ steps.send.outputs.ok != 'true' }}
+        env:
+          RESPONSE: ${{ steps.send.outputs.response }}
+        run: |
+          echo "::warning::Slack post failed: $(jq -r '.error // "unknown error"' <<<"$RESPONSE" 2>/dev/null || echo "$RESPONSE")"
